@@ -20,7 +20,7 @@ class CUTPModel(BaseModel):
     def modify_commandline_options(parser, is_train=True):
         """  Configures options specific for CUT model
         """
-        parser.add_argument('--CUT_mode', type=str, default="CUT", choices='(CUT, cut, FastCUT, fastcut)')
+        parser.add_argument('--CUT_mode', type=str, default="CUT", choices='(CUT, cut, cutp, FastCUT, fastcut)') #@pw
 
         parser.add_argument('--lambda_GAN', type=float, default=1.0, help='weight for GAN loss：GAN(G(X))')
         parser.add_argument('--lambda_NCE', type=float, default=1.0, help='weight for NCE loss: NCE(G(X), X)')
@@ -28,7 +28,9 @@ class CUTPModel(BaseModel):
         # parser.add_argument('--style_weight', type=float, default=10.0)
         # parser.add_argument('--content_weight', type=float, default=1.0)
         # parser.add_argument('--ccp_weight', type=float, default=5.0)
-        parser.add_argument('--lambda_CCP',type=float,default=5.0) #@pw
+        parser.add_argument('--lambda_CCP',type=float,default=1.0) #@pw
+        parser.add_argument('--ccp_layers', type=str, default='0,4,8,12,16', help='compute CCP loss on which layers') #@pw
+        parser.add_argument('--num_s', type=int, default=8, help='number of sampled anchor vectors') #@pw
 
 
         parser.add_argument('--nce_idt', type=util.str2bool, nargs='?', const=True, default=False, help='use NCE loss for identity mapping: NCE(G(Y), Y))')
@@ -56,6 +58,8 @@ class CUTPModel(BaseModel):
                 nce_idt=False, lambda_NCE=10.0, flip_equivariance=True,
                 n_epochs=150, n_epochs_decay=50
             )
+        elif opt.CUT_mode.lower()=='cutp': #@pw
+            parser.set_defaults(nce_idt=True)
         else:
             raise ValueError(opt.CUT_mode)
 
@@ -69,9 +73,12 @@ class CUTPModel(BaseModel):
         self.loss_names = ['G_GAN', 'D_real', 'D_fake', 'G', 'NCE','CCP'] #@pw
         self.visual_names = ['real_A', 'fake_B', 'real_B']
         self.nce_layers = [int(i) for i in self.opt.nce_layers.split(',')]
+        self.ccp_layers = [int(i) for i in self.opt.ccp_layers.split(',')] #@pw
+
 
         if opt.nce_idt and self.isTrain:
             self.loss_names += ['NCE_Y']
+            self.loss_names += ['CCP_Y'] #@pw
             self.visual_names += ['idt_B']
 
         if self.isTrain:
@@ -88,13 +95,12 @@ class CUTPModel(BaseModel):
 
             # define loss functions
             self.criterionGAN = networks.GANLoss(opt.gan_mode).to(self.device)
+            self.criterionIdt = torch.nn.L1Loss().to(self.device)
             self.criterionNCE = []
-
             for nce_layer in self.nce_layers:
                 self.criterionNCE.append(PatchNCELoss(opt).to(self.device))
-
-            self.criterionIdt = torch.nn.L1Loss().to(self.device)
-            self.criterionCCP=CCPL().to(self.device) #@pw
+            for ccp_layer in self.ccp_layers: #@pw
+                self.criterionCCP=append(PatchNCELoss(opt).to(self.device)) #@pw
 
             self.optimizer_G = torch.optim.Adam(self.netG.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
             self.optimizer_D = torch.optim.Adam(self.netD.parameters(), lr=opt.lr, betas=(opt.beta1, opt.beta2))
@@ -116,7 +122,7 @@ class CUTPModel(BaseModel):
         if self.opt.isTrain:
             self.compute_D_loss().backward()                  # calculate gradients for D
             self.compute_G_loss().backward()                   # calculate graidents for G
-            if self.opt.lambda_NCE > 0.0:
+            if self.opt.lambda_NCE > 0.0 or self.opt.lambda_CCP >0.0: #@pw
                 self.optimizer_F = torch.optim.Adam(self.netF.parameters(), lr=self.opt.lr, betas=(self.opt.beta1, self.opt.beta2))
                 self.optimizers.append(self.optimizer_F)
 
@@ -202,30 +208,36 @@ class CUTPModel(BaseModel):
         else:
             loss_NCE_both = self.loss_NCE
 
-        #self.loss_CCP et al will be used in get_current_losses()
-        self.loss_CCP=self.calculate_CCP_loss(self.real_A,self.fake_B) #@pw
-        self.loss_G = self.loss_G_GAN + loss_NCE_both + self.loss_CCP #@pw
+        if self.opt.lambda_CCP>0.0: #@pw
+            #self.loss_CCP et al will be used in get_current_losses()
+            self.loss_CCP=self.calculate_CCP_loss(self.real_A,self.fake_B)
+        else:
+            self.loss_CCP=0.0
+
+        if self.opt.nce_idt and self.opt.lambda_CCP>0.0: #@pw
+            self.loss_CCP_Y=self.calculate_CCP_loss(self.real_B,self.idt_B)
+            loss_CCP_both=(self.loss_CCP+self.loss_CCP_Y) * 0.5
+        else:
+            loss_CCP_both = self.loss_CCP
+
+        self.loss_G = self.loss_G_GAN + loss_NCE_both + loss_CCP_both#@pw
         return self.loss_G
 
-    def calculate_CCP_loss(self,src,tgt,tau=0.07): #@pw
-        """
-        srs:self.real_A
-        tgt:self.fake_B
-        """
+    def calculate_CCP_loss(self,src,tgt): #@pw
         #feature map of generated/target image
-        feat_q = self.netG(tgt, self.nce_layers, encode_only=True)
+        feat_q = self.netG(tgt, self.ccp_layers, encode_only=True)
         #feature map of content/source image
-        feat_k = self.netG(src, self.nce_layers, encode_only=True)
+        feat_k = self.netG(src, self.ccp_layers, encode_only=True)
+        #neighbor sample, mlp and l2norm
+        feat_k_pool, sample_ids = self.netF(feat_k, self.opt.num_s, None,neighbor=True)
+        feat_q_pool, _ = self.netF(feat_q, self.opt.num_s, sample_ids,neighbor=True)
 
-        self.criterionCCP(feat_q,feat_k,layer)
-
-        loss_ccp=0.0
-        for i in range(start_layer,end_layer):
-            f_q, sample_ids = self.NeighborSample(feats_q[i], i, num_s, [])
-            f_k, _ = self.NeighborSample(feats_k[i], i, num_s, sample_ids)   
-            loss_ccp += self.PatchNCELoss(f_q, f_k, tau) 
-        loss_ccp=loss_ccp*self.opt.lambda_CCP           
-        return loss_ccp
+        total_ccp_loss = 0.0
+        for f_q, f_k, crit, ccp_layer in zip(feat_q_pool, feat_k_pool, self.criterionCCP, self.ccp_layers):
+            loss = crit(f_q, f_k)
+            total_ccp_loss += loss.mean()
+        total_ccp_loss=total_ccp_loss*self.opt.lambda_CCP/len(self.ccp_layers)
+        return total_ccp_loss
 
     def calculate_NCE_loss(self, src, tgt):
         n_layers = len(self.nce_layers)
@@ -242,5 +254,4 @@ class CUTPModel(BaseModel):
         for f_q, f_k, crit, nce_layer in zip(feat_q_pool, feat_k_pool, self.criterionNCE, self.nce_layers):
             loss = crit(f_q, f_k) * self.opt.lambda_NCE
             total_nce_loss += loss.mean()
-
         return total_nce_loss / n_layers

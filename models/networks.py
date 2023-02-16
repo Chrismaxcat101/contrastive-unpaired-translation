@@ -550,27 +550,69 @@ class PatchSampleF(nn.Module):
         init_net(self, self.init_type, self.init_gain, self.gpu_ids)
         self.mlp_init = True
 
-    def forward(self, feats, num_patches=64, patch_ids=None):
+    def NeighborSample(self, feat, num_s, sample_ids=None): #@pw
+        """
+        sample neighbors for single layer's feature.
+        """
+        b, c, h, w = feat.size()
+        feat_r = feat.permute(0, 2, 3, 1).flatten(1, 2)
+        if sample_ids is None:
+            sample_ids=[]
+            dic = {0: -(w+1), 1: -w, 2: -(w-1), 3: -1, 4: 1, 5: w-1, 6: w, 7: w+1}
+            s_ids = torch.randperm((h - 2) * (w - 2), device=feat.device) # indices of top left vectors
+            s_ids = s_ids[:int(min(num_s, s_ids.shape[0]))]
+            ch_ids = (s_ids // (w - 2) + 1) # centors
+            cw_ids = (s_ids % (w - 2) + 1)
+            c_ids = (ch_ids * w + cw_ids).repeat(8)
+            delta = [dic[i // num_s] for i in range(8 * num_s)]
+            delta = torch.tensor(delta).to(feat.device)
+            n_ids = c_ids + delta
+            sample_ids += [c_ids]
+            sample_ids += [n_ids]
+        else:
+            c_ids = sample_ids[0]
+            n_ids = sample_ids[1]
+        feat_c, feat_n = feat_r[:, c_ids, :], feat_r[:, n_ids, :]
+        feat_d = feat_c - feat_n
+        return feat_d,sample_ids
+
+    def Sample(self, feat, num_patches, patch_id=None): #@pw moved from forward().
+        """
+        sample single layer's feature.
+        """
+        feat_reshape = feat.permute(0, 2, 3, 1).flatten(1, 2)
+        if num_patches > 0:
+            if patch_id is None:
+                # torch.randperm produces cudaErrorIllegalAddress for newer versions of PyTorch. https://github.com/taesungp/contrastive-unpaired-translation/issues/83
+                #patch_id = torch.randperm(feat_reshape.shape[1], device=feats[0].device)
+                patch_id = np.random.permutation(feat_reshape.shape[1])
+                patch_id = patch_id[:int(min(num_patches, patch_id.shape[0]))]  # .to(patch_ids.device)
+            patch_id = torch.tensor(patch_id, dtype=torch.long, device=feat.device)
+            x_sample = feat_reshape[:, patch_id, :].flatten(0, 1)  # reshape(-1, x.shape[1])
+        else:
+            x_sample = feat_reshape
+            patch_id = []
+            
+        return x_sample,patch_id
+
+    def forward(self, feats, num_patches=64, patch_ids=None,neighbor=False): #@pw
+        """
+        neighbor: use NeighborSample instead of Sample
+        when neighbor==True, num_patches represents num_s.
+        """
         return_ids = []
         return_feats = []
         if self.use_mlp and not self.mlp_init:
             self.create_mlp(feats)
         for feat_id, feat in enumerate(feats):
             B, H, W = feat.shape[0], feat.shape[2], feat.shape[3]
-            feat_reshape = feat.permute(0, 2, 3, 1).flatten(1, 2)
-            if num_patches > 0:
-                if patch_ids is not None:
-                    patch_id = patch_ids[feat_id]
-                else:
-                    # torch.randperm produces cudaErrorIllegalAddress for newer versions of PyTorch. https://github.com/taesungp/contrastive-unpaired-translation/issues/83
-                    #patch_id = torch.randperm(feat_reshape.shape[1], device=feats[0].device)
-                    patch_id = np.random.permutation(feat_reshape.shape[1])
-                    patch_id = patch_id[:int(min(num_patches, patch_id.shape[0]))]  # .to(patch_ids.device)
-                patch_id = torch.tensor(patch_id, dtype=torch.long, device=feat.device)
-                x_sample = feat_reshape[:, patch_id, :].flatten(0, 1)  # reshape(-1, x.shape[1])
+            patch_id=None if patch_ids is None else patch_ids[feat_id]
+            
+            if neighbor:
+                x_sample,patch_id=self.NeighborSample(feat,num_patches,patch_id)
             else:
-                x_sample = feat_reshape
-                patch_id = []
+                x_sample,patch_id=self.Sample(feat,num_patches,patch_id)
+            
             if self.use_mlp:
                 mlp = getattr(self, 'mlp_%d' % feat_id)
                 x_sample = mlp(x_sample)

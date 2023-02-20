@@ -3,7 +3,6 @@ import torch
 from .base_model import BaseModel
 from . import networks
 from .patchnce import PatchNCELoss
-from .net import CCPL
 import util.util as util
 
 

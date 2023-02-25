@@ -1443,3 +1443,8 @@ class GroupedChannelNorm(nn.Module):
         std = x.std(dim=2, keepdim=True)
         x_norm = (x - mean) / (std + 1e-7)
         return x_norm.view(*shape)
+
+if __name__=='__main__':
+    net=ResnetGenerator(3, 3, ngf=64, norm_layer=functools.partial(nn.InstanceNorm2d, affine=False, track_running_stats=False), use_dropout=False, n_blocks=9, padding_type='reflect', no_antialias=False, no_antialias_up=False, opt=None)
+    for layer_id,layer in enumerate(net.model):
+        print(layer_id,layer)
